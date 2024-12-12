@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import requests
-from requests.exceptions import ConnectionError
+from requests.exceptions import ConnectionError, ReadTimeout
 
 from src.api_utils import get_rate_limits
 from src.json_utils import load_json, save_json
@@ -88,15 +88,14 @@ def get_search_parameters(
 
 def get_all_listings(
     all_listings: dict[str, dict] | None = None,
-    url: str | None = None,
     tag_item_class_no: int | None = None,
     tag_drop_rate_str: str | None = None,
     rarity: str | None = None,
     start_index: int = 0,
     listing_output_file_name: str | None = None,
 ) -> dict[str, dict]:
-    if url is None:
-        url = get_steam_market_search_url()
+    if listing_output_file_name is None:
+        listing_output_file_name = get_listing_output_file_name()
 
     cookie = get_cookie_dict()
     has_secured_cookie = bool(len(cookie) > 0)
@@ -112,7 +111,9 @@ def get_all_listings(
     num_listings = None
 
     query_count = 0
-    delta_index = 100
+    base_delay = 5  # Start with 5 seconds
+    max_retries = 3
+    delta_index = 50  # Reduced from 100 to 50 items per request
 
     while (num_listings is None) or (start_index < num_listings):
         if num_listings is not None:
@@ -138,22 +139,39 @@ def get_all_listings(
             time.sleep(cooldown_duration)
             query_count = 0
 
-        try:
-            if has_secured_cookie:
-                resp_data = requests.get(
-                    url,
-                    params=req_data,
-                    cookies=cookie,
-                    timeout=TIMEOUT_IN_SECONDS,
-                )
-            else:
-                resp_data = requests.get(
-                    url,
-                    params=req_data,
-                    timeout=TIMEOUT_IN_SECONDS,
-                )
-        except ConnectionError:
-            resp_data = None
+        for retry in range(max_retries):
+            try:
+                if has_secured_cookie:
+                    resp_data = requests.get(
+                        get_steam_market_search_url(),
+                        params=req_data,
+                        cookies=cookie,
+                        timeout=TIMEOUT_IN_SECONDS,
+                    )
+                else:
+                    resp_data = requests.get(
+                        get_steam_market_search_url(),
+                        params=req_data,
+                        timeout=TIMEOUT_IN_SECONDS,
+                    )
+                
+                if resp_data.ok:
+                    break
+                    
+                delay = base_delay * (2 ** retry)
+                print(f"Request failed with status {resp_data.status_code}, waiting {delay} seconds before retry {retry + 1}/{max_retries}")
+                time.sleep(delay)
+                
+            except (ConnectionError, ReadTimeout):
+                if retry == max_retries - 1:
+                    resp_data = None
+                    break
+                    
+                delay = base_delay * (2 ** retry)
+                print(f"Request failed with connection error, waiting {delay} seconds before retry {retry + 1}/{max_retries}")
+                time.sleep(delay)
+
+        time.sleep(1)
 
         start_index += delta_index
         query_count += 1
@@ -222,7 +240,6 @@ def download_all_listings(
 
 def update_all_listings(
     listing_output_file_name: str | None = None,
-    url: str | None = None,
     tag_item_class_no: int | None = None,
     tag_drop_rate_str: str | None = None,
     rarity: str | None = None,
@@ -245,7 +262,6 @@ def update_all_listings(
 
     all_listings = get_all_listings(
         all_listings,
-        url=url,
         tag_item_class_no=tag_item_class_no,
         tag_drop_rate_str=tag_drop_rate_str,
         rarity=rarity,
