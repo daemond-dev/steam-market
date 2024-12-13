@@ -7,7 +7,7 @@ from pathlib import Path
 import requests
 from requests.exceptions import ConnectionError, ReadTimeout
 
-from src.api_utils import get_rate_limits
+from src.api_utils import get_rate_limits, AdaptiveRateLimiter
 from src.json_utils import load_json, save_json
 from src.personal_info import (
     get_cookie_dict,
@@ -18,10 +18,15 @@ from src.utils import (
     TIMEOUT_IN_SECONDS,
     get_listing_output_file_name,
 )
+from src.request_utils import parse_json_response
+
+# Maximum number of retry attempts for failed requests
+max_retries = 3
 
 
 def get_steam_market_search_url() -> str:
-    return "https://steamcommunity.com/market/search/render/"
+    # Use raw string to avoid escape sequence warnings
+    return r"https://steamcommunity.com/market/search/render/"
 
 
 def get_tag_item_class_no_for_trading_cards() -> int:
@@ -88,11 +93,11 @@ def get_search_parameters(
 
 def get_all_listings(
     all_listings: dict[str, dict] | None = None,
+    listing_output_file_name: str | None = None,
     tag_item_class_no: int | None = None,
     tag_drop_rate_str: str | None = None,
     rarity: str | None = None,
     start_index: int = 0,
-    listing_output_file_name: str | None = None,
 ) -> dict[str, dict]:
     if listing_output_file_name is None:
         listing_output_file_name = get_listing_output_file_name()
@@ -110,22 +115,30 @@ def get_all_listings(
 
     num_listings = None
 
+    rate_limiter = AdaptiveRateLimiter()
     query_count = 0
-    base_delay = 5  # Start with 5 seconds
-    max_retries = 3
     delta_index = 50  # Reduced from 100 to 50 items per request
 
     while (num_listings is None) or (start_index < num_listings):
-        if num_listings is not None:
-            print(f"[{start_index}/{num_listings}]")
-
-        req_data = get_search_parameters(
-            start_index=start_index,
-            delta_index=delta_index,
-            tag_item_class_no=tag_item_class_no,
-            tag_drop_rate_str=tag_drop_rate_str,
-            rarity=rarity,
-        )
+        success = False  # Track if we successfully got data for this batch
+        
+        # Define request parameters
+        req_data = {
+            "start": start_index,
+            "count": delta_index,
+            "sort_column": "name",
+            "sort_dir": "asc",
+            "norender": 1,
+        }
+        
+        if tag_item_class_no is not None:
+            req_data["category_753_item_class[]"] = f"tag_{tag_item_class_no}"
+            
+        if tag_drop_rate_str is not None:
+            req_data["category_753_droprate[]"] = tag_drop_rate_str
+            
+        if rarity is not None:
+            req_data["category_753_rarity[]"] = f"tag_Rarity_{rarity}"
 
         if query_count >= rate_limits["max_num_queries"]:
             if listing_output_file_name:
@@ -133,43 +146,62 @@ def get_all_listings(
                 save_json(all_listings, listing_output_file_name)
 
             cooldown_duration = rate_limits["cooldown"]
-            print(
-                f"Number of queries {query_count} reached. Cooldown: {cooldown_duration} seconds",
-            )
+            print(f"Number of queries {query_count} reached. Cooldown: {cooldown_duration} seconds")
             time.sleep(cooldown_duration)
             query_count = 0
+            rate_limiter.error_count = 0  # Reset error count after cooldown
 
-        for retry in range(max_retries):
-            try:
-                if has_secured_cookie:
-                    resp_data = requests.get(
-                        get_steam_market_search_url(),
-                        params=req_data,
-                        cookies=cookie,
-                        timeout=TIMEOUT_IN_SECONDS,
-                    )
-                else:
-                    resp_data = requests.get(
-                        get_steam_market_search_url(),
-                        params=req_data,
-                        timeout=TIMEOUT_IN_SECONDS,
-                    )
-                
-                if resp_data.ok:
-                    break
+        while not success:  # Keep trying this batch until we succeed
+            for retry in range(max_retries):
+                try:
+                    rate_limiter.pre_request()
                     
-                delay = base_delay * (2 ** retry)
-                print(f"Request failed with status {resp_data.status_code}, waiting {delay} seconds before retry {retry + 1}/{max_retries}")
-                time.sleep(delay)
-                
-            except (ConnectionError, ReadTimeout):
-                if retry == max_retries - 1:
-                    resp_data = None
-                    break
+                    if has_secured_cookie:
+                        resp_data = requests.get(
+                            get_steam_market_search_url(),
+                            params=req_data,
+                            cookies=cookie,
+                            timeout=TIMEOUT_IN_SECONDS,
+                        )
+                    else:
+                        resp_data = requests.get(
+                            get_steam_market_search_url(),
+                            params=req_data,
+                            timeout=TIMEOUT_IN_SECONDS,
+                        )
                     
-                delay = base_delay * (2 ** retry)
-                print(f"Request failed with connection error, waiting {delay} seconds before retry {retry + 1}/{max_retries}")
-                time.sleep(delay)
+                    rate_limiter.post_request(resp_data)
+                    
+                    if resp_data.ok:
+                        success = True
+                        break
+                        
+                    if resp_data.status_code == 429:  # Rate limit hit
+                        rate_limiter._handle_error()
+                        cooldown = max(rate_limits["cooldown"], 60)
+                        print(f"Rate limit hit. Cooling down for {cooldown} seconds...")
+                        time.sleep(cooldown)
+                        break  # Break retry loop but not success loop
+                    
+                    delay = rate_limiter.current_delay
+                    print(f"Request failed with status {resp_data.status_code}, waiting {delay:.1f} seconds before retry {retry + 1}/{max_retries}")
+                    time.sleep(delay)
+                    
+                except (ConnectionError, ReadTimeout):
+                    rate_limiter.post_request(None)
+                    if retry == max_retries - 1:
+                        resp_data = None
+                        break
+                    
+                    delay = rate_limiter.current_delay
+                    print(f"Request failed with connection error, waiting {delay:.1f} seconds before retry {retry + 1}/{max_retries}")
+                    time.sleep(delay)
+            
+            if success:
+                break
+            
+            print(f"Failed to get data for batch at index {start_index}, retrying after cooldown...")
+            time.sleep(rate_limits["cooldown"])
 
         time.sleep(1)
 

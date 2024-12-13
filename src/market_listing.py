@@ -4,9 +4,10 @@ import time
 from http import HTTPStatus
 
 import requests
+from requests.exceptions import ConnectionError, ReadTimeout
 from bs4 import BeautifulSoup
 
-from src.api_utils import get_rate_limits
+from src.api_utils import get_rate_limits, AdaptiveRateLimiter
 from src.json_utils import load_json, save_json
 from src.market_search import load_all_listings
 from src.personal_info import (
@@ -17,6 +18,10 @@ from src.utils import (
     TIMEOUT_IN_SECONDS,
     get_listing_details_output_file_name,
 )
+from src.request_utils import parse_json_response
+
+# Maximum number of retry attempts for failed requests
+max_retries = 3
 
 
 def get_steam_market_listing_url(
@@ -47,9 +52,7 @@ def get_steam_market_listing_url(
         fixed_listing_hash = fixed_listing_hash.replace("(", "%28")
         fixed_listing_hash = fixed_listing_hash.replace(")", "%29")
 
-    market_listing_url = (
-        f"https://steamcommunity.com/market/listings/{app_id}/{fixed_listing_hash}/"
-    )
+    market_listing_url = rf"https://steamcommunity.com/market/listings/{app_id}/{fixed_listing_hash}/"
 
     if render_as_json:
         market_listing_url += "render/"
@@ -273,13 +276,10 @@ def get_listing_details(
         resp_data = requests.get(url, params=req_data, timeout=TIMEOUT_IN_SECONDS)
 
     if resp_data.ok:
-        html_doc = resp_data.text
+        result = parse_json_response(resp_data)
+        jar = dict(resp_data.cookies)
 
-        if has_secured_cookie:
-            jar = dict(resp_data.cookies)
-            cookie = update_and_save_cookie_to_disk_if_values_changed(cookie, jar)
-
-        item_nameid, is_marketable, item_type_no = parse_item_name_id(html_doc)
+        item_nameid, is_marketable, item_type_no = parse_item_name_id(result["html_doc"])
 
         if item_nameid is None:
             print(f"Item name ID not found for {listing_hash}")
@@ -307,8 +307,11 @@ def get_listing_details_batch(
     save_to_disk: bool = True,
     listing_details_output_file_name: str | None = None,
 ) -> dict[str, dict]:
-    if listing_details_output_file_name is None:
-        listing_details_output_file_name = get_listing_details_output_file_name()
+    if isinstance(listing_hashes, dict):
+        listing_hashes = list(listing_hashes.keys())
+
+    if all_listing_details is None:
+        all_listing_details = {}
 
     cookie = get_cookie_dict()
     has_secured_cookie = bool(len(cookie) > 0)
@@ -317,45 +320,107 @@ def get_listing_details_batch(
         "market_listing",
         has_secured_cookie=has_secured_cookie,
     )
+    cooldown_duration = rate_limits["cooldown"]
 
-    if all_listing_details is None:
-        all_listing_details = {}
+    rate_limiter = AdaptiveRateLimiter()
+    query_count = 0
 
     num_listings = len(listing_hashes)
-
-    query_count = 0
+    print(f"Processing {num_listings} listings...")
 
     for count, listing_hash in enumerate(listing_hashes):
         if (count + 1) % 100 == 0:
             print(f"[{count + 1}/{num_listings}]")
 
-        listing_details, status_code = get_listing_details(
-            listing_hash=listing_hash,
-            cookie=cookie,
-        )
+        success = False
+        while not success:
+            if query_count >= rate_limits["max_num_queries"]:
+                if save_to_disk and listing_details_output_file_name:
+                    print(f"Saving temporary data to {listing_details_output_file_name}.")
+                    save_json(all_listing_details, listing_details_output_file_name)
 
-        query_count += 1
+                print(f"Number of queries {query_count} reached. Cooldown: {cooldown_duration} seconds")
+                time.sleep(cooldown_duration)
+                query_count = 0
+                rate_limiter.error_count = 0
 
-        if status_code != HTTPStatus.OK:
-            print(
-                f"Wrong status code ({status_code}) for {listing_hash} after {query_count} queries.",
-            )
-            break
+            for retry in range(max_retries):
+                try:
+                    rate_limiter.pre_request()
+                    resp_data = requests.get(
+                        get_steam_market_listing_url(
+                            listing_hash=listing_hash,
+                            render_as_json=True,
+                        ),
+                        cookies=cookie,
+                        timeout=TIMEOUT_IN_SECONDS,
+                    )
+                    rate_limiter.post_request(resp_data)
 
-        if query_count >= rate_limits["max_num_queries"]:
-            if save_to_disk:
-                save_json(all_listing_details, listing_details_output_file_name)
+                    if not resp_data.ok:
+                        if resp_data.status_code == 429:  # Rate limit hit
+                            rate_limiter._handle_error()
+                            print(f"Rate limit hit. Cooling down for {cooldown_duration} seconds...")
+                            time.sleep(cooldown_duration)
+                            break  # Break retry loop but not success loop
+                        
+                        delay = rate_limiter.current_delay
+                        print(f"Request failed with status {resp_data.status_code}, waiting {delay:.1f} seconds before retry {retry + 1}/{max_retries}")
+                        time.sleep(delay)
+                        continue
 
-            cooldown_duration = rate_limits["cooldown"]
-            print(
-                f"Number of queries {query_count} reached. Cooldown: {cooldown_duration} seconds",
-            )
-            time.sleep(cooldown_duration)
-            query_count = 0
+                    try:
+                        result = parse_json_response(resp_data)
+                    except (ValueError, requests.exceptions.JSONDecodeError) as e:
+                        print(f"Failed to parse JSON for {listing_hash}: {e}")
+                        time.sleep(cooldown_duration)
+                        continue
 
-        all_listing_details.update(listing_details)
+                    if not isinstance(result, dict) or "html_doc" not in result:
+                        print(f"Invalid response format for {listing_hash}")
+                        print(f"Cooling down for {cooldown_duration} seconds...")
+                        time.sleep(cooldown_duration)
+                        continue
 
-    if save_to_disk:
+                    try:
+                        item_nameid, is_marketable, item_type_no = parse_item_name_id(result["html_doc"])
+                    except (ValueError, KeyError) as e:
+                        print(f"Failed to parse item details for {listing_hash}: {e}")
+                        print(f"Cooling down for {cooldown_duration} seconds...")
+                        time.sleep(cooldown_duration)
+                        continue
+
+                    listing_details = {
+                        listing_hash: {
+                            "item_nameid": item_nameid,
+                            "is_marketable": is_marketable,
+                            "item_type_no": item_type_no,
+                        }
+                    }
+                    success = True
+                    break
+
+                except (ConnectionError, ReadTimeout):
+                    rate_limiter.post_request(None)
+                    if retry == max_retries - 1:
+                        break
+
+                    delay = rate_limiter.current_delay
+                    print(f"Request failed with connection error, waiting {delay:.1f} seconds before retry {retry + 1}/{max_retries}")
+                    time.sleep(delay)
+
+            if success:
+                query_count += 1
+                all_listing_details.update(listing_details)
+                
+                if has_secured_cookie:
+                    jar = dict(resp_data.cookies)
+                    cookie = update_and_save_cookie_to_disk_if_values_changed(cookie, jar)
+            else:
+                print(f"Failed to get details for {listing_hash}, cooling down for {cooldown_duration} seconds...")
+                time.sleep(cooldown_duration)
+
+    if save_to_disk and listing_details_output_file_name:
         save_json(all_listing_details, listing_details_output_file_name)
 
     return all_listing_details
@@ -521,6 +586,19 @@ def main() -> bool:
     update_all_listing_details(listing_hashes)
 
     return True
+
+
+def parse_response_text(text: str) -> dict:
+    """Parse response text while ignoring escape sequence warnings."""
+    # Replace problematic escape sequences
+    cleaned_text = text.replace(r"\/", "/")
+    return ast.literal_eval(cleaned_text)
+
+
+def parse_json_response(response: requests.Response) -> dict:
+    """Parse JSON response while handling escape sequences."""
+    text = response.text.replace(r"\/", "/")
+    return response.json()
 
 
 if __name__ == "__main__":
